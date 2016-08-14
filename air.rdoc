@@ -1,0 +1,5 @@
+= air
+
+Generate this with
+    air rdoc
+After you have described your command line interface

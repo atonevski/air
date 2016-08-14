@@ -1,0 +1,11 @@
+development:
+  adapter: 'sqlite3'
+#  database: '/home/and/Scripts/Ruby/air/db/air.db'
+# @ home:
+  database: '/home/atonevski/scripts/ruby/air/db/air.db'
+
+test:
+  adapter: 'sqlite3'
+#  database: '/home/and/Scripts/Ruby/air/db/air-test.db'
+# @ home:
+  database: '/home/atonevski/scripts/ruby/air/db/air-test.db'

@@ -1,0 +1,497 @@
+#!/usr/bin/env ruby
+require 'gli'
+require 'active_support/core_ext/hash'
+require 'json'
+require 'colorize'
+require 'active_record'
+
+begin # XXX: Remove this begin/rescue before distributing your app
+require 'air'
+rescue LoadError
+  STDERR.puts "In development, you need to use `bundle exec bin/air` to run your app"
+  STDERR.puts "At install-time, RubyGems will make sure lib, etc. are in the load path"
+  STDERR.puts "Feel free to remove this message from bin/air now"
+  exit 64
+end
+
+include GLI::App
+
+program_desc 'Describe your application here'
+
+version Air::VERSION
+
+ymlfile = File.expand_path '../../db/config.yml', __FILE__
+logfile = File.expand_path '../../db/db.log', __FILE__
+
+dbconfig = (YAML::load File.open(ymlfile)).with_indifferent_access
+
+# keep 10 log files, file size at most 1MB
+ActiveRecord::Base.establish_connection dbconfig[:development]
+ActiveRecord::Base.logger                     = Logger.new logfile, 10, 1024*1024
+ActiveSupport::LogSubscriber.colorize_logging = false
+
+subcommand_option_handling :normal
+arguments :strict
+
+# verbose flag
+flag :verbose, desc: 'Verbose', default_value: 'false', must_match: ['true', 'false']
+
+desc "Daily air quality"
+command :daily do |c|
+  c.flag :station, desc: 'Station', default_value: 'GaziBaba',
+          must_match: Air::CONFIG[:stations].keys
+
+  c.flag :parameter, desc: 'Parameter', default_value: 'PM10',
+          must_match: Air::CONFIG[:parameters].keys
+
+  c.flag :date, desc: 'Date', default_value: Date.today.strftime('%Y-%m-%d'),
+          must_match: /^\d{4}-\d\d-\d\d$/
+
+  c.action do |global_opts, opts, args|
+
+    puts "#{ global_opts }"
+
+    data = Air.get(opts.with_indifferent_access)
+
+    # title
+    puts sprintf(Air::CONFIG[:table][:title],
+          Air::CONFIG[:parameters][data[:parameter]][:shortName]).center(75)
+    # table header
+    print 'Време'.ljust(16).underline + ' '
+    data[:stations].each { |s| print Air::CONFIG[:stations][s][:name].underline + ' ' }
+    puts
+    data[:measurements].each do |k, v|
+      print "#{ Air.dt_fmt(k)} "
+
+      data[:stations].each do |s|
+        print v[s].to_s.rjust(Air::CONFIG[:stations][s][:name].length).
+            colorize(Air.level_color(data[:parameter], v[s])) + " "
+      end
+      puts
+    end
+  end
+end
+
+
+desc "Update"
+command :update do |c|
+  update_parameters = Air::CONFIG[:parameters].keys - ['PM10D'] + ['all']
+
+  c.flag :station, desc: 'Station', default_value: 'GaziBaba',
+          must_match: Air::CONFIG[:stations].keys.select { |s| s !~ /region$/i }
+
+  c.flag :parameter, desc: 'Parameter', default_value: 'PM10',
+          must_match: update_parameters
+
+  c.action do |global_opts, opts, args|
+    opts = opts.with_indifferent_access
+    puts "Update until #{ Date.today - 1 }"
+   
+    if opts[:parameter] == 'all'
+      station_id  = Station.find_by_name(opts[:station]).id
+      param_ids   = Update.where(station_id: station_id).map { |r| r.parameter_id }
+      params      = Parameter.where(id: param_ids).map { |r| r.name }
+
+      puts "avail params for station: #{ opts[:station] }: #{ params.join ', ' }"
+      
+      param_ids.each do |param_id|
+        param = Parameter.find(param_id).name
+        puts "Updating parameter #{ param }".colorize(:white).bold
+        update = Update.find_by_parameter_id_and_station_id(param_id, station_id)
+
+        opts[:parameter] = param
+        # update loop:
+        while update.day + 1 <= Date.today - 1 do
+          opts[:date] = (update.day + 1).strftime Air::YMD_FMT
+
+          # 1st measurements, then update record
+          Air.update opts 
+
+          update = Update.find_by_parameter_id_and_station_id(param_id, station_id)
+        end
+      end
+    else
+      param_id    = Parameter.find_by_name(opts[:parameter]).id
+      station_id  = Station.find_by_name(opts[:station]).id
+      update      = Update.find_by_parameter_id_and_station_id(param_id, station_id)
+      unless update # is nil
+        exit_now! "Parameter: #{ opts[:parameter] } not available for station #{ opts[:station] }".colorize(:red)
+      end
+      puts "Start updating from: #{ update.day + 1 }"
+
+      # consider:
+      while update.day + 1 <= Date.today - 1 do
+        opts[:date] = (update.day + 1).strftime Air::YMD_FMT
+        Air.update opts 
+
+        update = Update.find_by_parameter_id_and_station_id(param_id, station_id)
+      end
+    end
+  end
+end
+
+desc 'Build'
+arg_name 'table(s)', desc: 'Tables: stations, parameters, groups, measurements'
+command :build do |c|
+  all_tables = %W{ stations parameters regions updates measurements }
+  c.action do |global_opts, opts, args|
+    args.map! { |a| a.downcase }
+    raise "invalid table name in #{ args.join ', ' }" unless (args - all_tables).empty?
+    args.each do |t|
+      case t
+      when 'regions'
+        regions = Air::CONFIG[:stations].select { |k, v| k =~ /region$/i }
+        Region.delete_all
+        regions.each do |k, v|
+          Region.create(
+            id:   v[:id],
+            name: k.to_s,
+            mk:   v[:name])
+        end
+      when 'stations'
+        regions = Air::CONFIG[:stations].select { |k, v| k =~ /region$/i }
+        Station.delete_all
+        Air::CONFIG[:stations].keys.select { |s| s !~ /region$/i }.each do |s|
+          Station.create(
+            name: s, mk: Air::CONFIG[:stations][s][:name],
+            region_id: regions[Air::CONFIG[:stations][s][:region]][:id])
+        end
+      when 'parameters'
+        Parameter.delete_all
+        Air::CONFIG[:parameters].each do |k, v|
+          # transform to hash ready to use with Parameter.create(h)
+          h = { name: k, mk: v[:name], unit: v[:unit], short: v[:shortName],
+                short_no_subscript: v[:shortNameNoSubscript] }
+          # now the levels
+          levels = v[:levels].map { |n, r| [n.to_sym, [r.min, r.max]] }.to_h
+          h[:levels] = levels.to_json
+          
+          Parameter.create h
+        end
+      when 'updates'
+        # put initial update a day before START_DATE
+        unless Update.count == 0
+          exit_now! "Updates not empty!\nYou have to manually erase Updates!".colorize(:red)
+        end
+        Update.delete_all
+        Air::START_DATE.each do |station_name, params_dates|
+          station = Station.find_by_name(station_name.to_s)
+          params_dates.each do |param_name, date|
+            next unless date # skip NA (without start date)
+            param = Parameter.find_by_name(param_name.to_s)
+            Update.create(day: date - 1, parameter_id: param.id, station_id: station.id)
+          end
+        end
+
+        Update.all.each do |upd|
+          station   = upd.station       # Station.find(upd.station_id)
+          parameter = upd.parameter     # Parameter.find(upd.parameter_id)
+          puts "#{ station.name } #{ parameter.name } #{ upd.day }"
+        end
+
+      when 'measurements'
+        # attributes: day, parameter_id, station_id, count (>0), hash, min, max, avg 
+        unless Measurement.count == 0
+          exit_now! "Measurements not empty!\nYou have to manually erase Measurements!".colorize(:red)
+        end
+      end
+    end
+  end
+end
+
+desc "Meta data"
+command :meta, :metadata do |c|
+  c.flag :station, desc: 'Station', default_value: 'GaziBaba',
+          must_match: (Air::CONFIG[:stations].keys.dup << 'all')
+
+  c.action do |global_opts, opts, args|
+    # title
+    puts Air::CONFIG[:metadata][:title].center(75)
+
+    # table header
+    print "Мерна станица".ljust(16).underline
+    Air::CONFIG[:parameters].keys.each { |p| 
+            print (Air::CONFIG[:parameters][p][:shortName] + ' ').underline }
+    puts
+
+    data        = Air.metadata opts.with_indifferent_access
+    parameters  = Air::CONFIG[:parameters].keys
+    data.each do |station, parameters|
+      printf "%-15.15s ", Air::CONFIG[:stations][station][:name]
+      Air::CONFIG[:parameters].keys.each do |p|
+        sym = if parameters.include?(p) then '✓' else '' end
+        print sym.center(Air::CONFIG[:parameters][p][:shortName].length) + ' '
+      end
+      puts
+    end
+  end
+end
+
+desc "Stats"
+command :stats do |c|
+  c.flag :station, desc: 'Station', default_value: 'GaziBaba',
+          must_match: Air::CONFIG[:stations].keys.select { |s| s !~ /region$/i }
+
+  c.flag :parameter, desc: 'Parameter', default_value: 'PM10',
+          must_match: Air::CONFIG[:parameters].keys
+
+  c.action do |global_opts, opts, args|
+    opts = opts.with_indifferent_access
+    
+    param_id    = Parameter.find_by_name(opts[:parameter]).id
+    station_id  = Station.find_by_name(opts[:station]).id
+
+    last_update         = Update.find_by_parameter_id_and_station_id(param_id, station_id)
+    all_measurements    = Measurement.where(parameter_id: param_id, station_id: station_id).
+                                      order(:id)
+    last_measurement    = all_measurements.last
+    first_measurement   = all_measurements.first
+    measurements_count  = all_measurements.count
+    total_days          = last_measurement.day - first_measurement.day + 1
+    
+    print "Station: " + opts[:station].colorize(mode: :bold) + ' '
+    print "Parameter: " + opts[:parameter].colorize(mode: :bold) + ' '
+    print "Last update: " + 
+            last_update.day.strftime(Air::YMD_FMT).colorize(mode: :bold) + " "
+    print "Last measurement: " + 
+            last_measurement.day.strftime(Air::YMD_FMT).colorize(mode: :bold) + "\n"
+
+    print "Total measurements: " + measurements_count.to_s.colorize(mode: :bold) + " "
+    print "In use: " + sprintf("%6.2f%%", measurements_count * 100.0 / total_days).
+                       colorize(mode: :bold) + "\n"
+ 
+    puts "GAPS:"
+    gap_days  = 0
+    gap_count = 0
+    all_measurements.each_with_index do |r, i|
+      break if i == measurements_count - 1
+      days = (all_measurements[i+1].day - r.day - 1).to_i
+      next if days == 0
+      puts "#{ r.day.strftime Air::YMD_FMT } -- #{ all_measurements[i+1].day.strftime Air::YMD_FMT }: #{ days }" 
+      gap_days  += days
+      gap_count += 1
+    end
+    print "Out of order: " + sprintf("%6.2f%%", gap_days * 100.0 / total_days).
+                       colorize(mode: :bold) + " "
+    print "Gaps: " + gap_count.to_s.colorize(mode: :bold) + "\n"
+
+
+    print "Min: " + sprintf("%7.2f ", all_measurements.average(:min)).colorize(mode: :bold)
+    print "Avg: " + sprintf("%7.2f ", all_measurements.average(:avg)).colorize(mode: :bold)
+    print "Max: " + sprintf("%7.2f ", all_measurements.average(:max)).colorize(mode: :bold)
+    puts
+
+    extreme = all_measurements.maximum(:max)
+    max_avg = all_measurements.maximum(:avg)
+
+    extreme_day = all_measurements.find { |m| m.max == extreme }.day
+    max_avg_day = all_measurements.find { |m| m.avg == max_avg }.day
+    print "Extreme: " + sprintf("%7.2f ", all_measurements.maximum(:max)).
+          colorize(mode: :bold, color: :red)
+    print "(#{ extreme_day.strftime Air::YMD_FMT }) "
+    
+    print "Max 24hr avg: " + sprintf("%7.2f ", all_measurements.maximum(:avg)).
+          colorize(mode: :bold, color: :red)
+    print "(#{ max_avg_day.strftime Air::YMD_FMT }) "
+    puts
+
+    # in use vs gaps count, gaps total
+    # consecutive above max 
+  end
+end
+
+
+desc "Plot"
+command :plot do |c|
+
+  c.command :wday, :weekday do |wday|
+    wday.flag :station, desc: 'Station', default_value: 'GaziBaba',
+            must_match: Air::CONFIG[:stations].keys.select { |s| s !~ /region$/i }
+
+    wday.flag :parameter, desc: 'Parameter', default_value: 'PM10',
+            must_match: Air::CONFIG[:parameters].keys
+    wday.action do |global_opts, opts, args|
+      opts = opts.with_indifferent_access
+      
+      param_id    = Parameter.find_by_name(opts[:parameter]).id
+      station_id  = Station.find_by_name(opts[:station]).id
+
+      data_file = File.expand_path '../../gnuplot/wday.data', __FILE__
+      File.open(data_file, 'w') do |f|
+        measurements = Measurement.where(parameter_id: param_id, station_id: station_id).
+                                   order(:id)
+        measurements.each do |m|
+          f.puts "#{ m.day.strftime Air::YMD_FMT } #{ m.avg }"
+        end
+      end
+    end
+  end
+  c.command :hour do |hour|
+    hour.flag :station, desc: 'Station', default_value: 'GaziBaba',
+            must_match: Air::CONFIG[:stations].keys.select { |s| s !~ /region$/i }
+
+    hour.flag :parameter, desc: 'Parameter', default_value: 'PM10',
+            must_match: Air::CONFIG[:parameters].keys
+    hour.action do |global_opts, opts, args|
+      opts = opts.with_indifferent_access
+      
+      param_id    = Parameter.find_by_name(opts[:parameter]).id
+      station_id  = Station.find_by_name(opts[:station]).id
+
+      data_file = File.expand_path '../../gnuplot/hour.data', __FILE__
+      File.open(data_file, 'w') do |f|
+        measurements = Measurement.where(parameter_id: param_id, station_id: station_id).
+                                   order(:id)
+        measurements.each do |m|
+          next unless m.day.year == 2015
+          JSON.parse(m.data).each do |h, v|
+            f.puts "#{ h.split(' ')[1] } #{ v }"
+          end
+        end
+      end
+    end
+  end
+end
+
+desc 'Last updates'
+command :last do |c|
+  c.action do |global_opts, opts, args|
+    param_ids = [ ]
+    print 'Station'.ljust(12).underline + ' '
+    Air::CONFIG[:parameters].each do |p, v|
+      next if p == 'PM10D'
+      print v[:shortName].center(10).bold.underline + ' '
+      param_ids << Parameter.find_by_name(p).id
+    end
+    puts
+
+    Air::CONFIG[:stations].each do |s, v|
+      next if s =~ /region$/i
+      print v[:name].ljust(12).colorize(mode: :bold) + ' '
+      station_id = Station.find_by_name(s).id
+      param_ids.each do |param_id|
+        updt = Update.find_by_parameter_id_and_station_id(param_id, station_id)
+        if updt
+          color = case Date.today - 1 - updt.day
+                  when 0..1 then :white
+                  when 2..3 then :dark_gray
+                  when 4..7 then :light_yellow
+                  else           :red
+                  end
+          print updt.day.strftime(Air::YMD_FMT).colorize(color) + ' '
+        else
+          print  ' '*11
+        end
+      end
+      puts
+    end
+  end
+end
+
+pre do |global,command,options,args|
+  # Pre logic here
+  # Return true to proceed; false to abort and not call the
+  # chosen command
+  # Use skips_pre before a command to skip this block
+  # on that command only
+  true
+end
+
+post do |global,command,options,args|
+  # Post logic here
+  # Use skips_post before a command to skip this
+  # block on that command only
+end
+
+on_error do |exception|
+  # Error logic here
+  # return false to skip default error handling
+  true
+end
+
+exit run(ARGV)
+
+__END__
+DONE:
+  - 2016-01-05 fully working daily reports
+  - 2016-01-06 added ranges/leves to parameters, and added colorization
+  - 2016-01-08 added meta data command, add underline attrib for table header line
+  - 2016-01-10 added meta data info for all stations
+  - 2016-01-10 added limits for parameters
+  - 2016-01-16 added db
+  - 2016-01-26 started rendering measurements
+  - 2016-02-01 fixed logger maximum file size, and file rotation
+  - 2016-02-01 finding gaps in measurements
+  - 2016-02-04 add new migration: add index to measurements on day
+  - 2016-02-06 completed data/mesurements for all stations
+  - 2016-02-09 added the last command: table with the last updates per station/parameter
+TODO:
+  - add plotting (same as sph) for the last 
+  - check if the site has the limits for parameters
+  - when adding bulder for measurements, should keep record for last update for each
+    measurement
+  - for the updates table, initially when building tables should contain the date for 
+    the day before the very first measurement per parameter/station
+  - update should be similar to get except it should run in transaction reading the 
+    data/measurements, transforming and storing it together with the updates record, 
+    it should skip storing if no measurements, but keep track of up/dates
+  - add the :verbose to get and update methods
+  - draw simillar table for done updates
+  - scatter plots for weekday measurements (avgs): Mon -- Sun, and by hour: 00 -- 23
+    should use year parameter since transparency would not be visible for huge amount
+    of data
+
+                       INITIAL DATES (FIRST MEASUREMENTS)
+
+Station           CO        NO2          O3        PM10        PM25         SO2
+----------- ----------- ----------- ----------- ----------- ----------- -----------
+Centar      *2008-01-01 *2011-09-09 *2011-09-09 !2011-09-12 *2011-09-10 *2008-01-01
+Karpos      *2008-01-01 *2011-09-10 *2011-09-09  2008-01-01 *2011-09-10 *2008-01-01
+Lisice      *2007-01-03 *2011-03-02 *2008-01-01  2008-01-01     NA      *2007-01-03
+GaziBaba    *2007-01-01 *2006-01-01      NA      2009-02-01     NA      *2007-01-05
+Rektorat    *2005-04-04 *2005-04-04 *2005-04-04 *2005-04-04     NA          NA
+Miladinovci *2009-01-01 *2006-01-01 *2008-01-01 *2009-01-01     NA      *2009-01-01
+Mrsevci     *2004-08-07 *2002-12-07      NA     *2002-12-07     NA      *2002-12-07
+
+Bitola1     *2007-01-01 *2011-11-12 *2008-01-01 *2008-01-01     NA      *2007-01-01
+Bitola2     *2007-01-01 *2011-12-26 *2008-01-01 *2008-01-01     NA      *2007-01-01 
+Kicevo      *2007-01-01 *2011-05-31 *2008-01-01 *2008-01-01     NA      *2007-01-01
+Lazaropole        NA    *2012-01-05 *2008-01-01 *2008-01-01     NA      *2007-01-01
+Tetovo      *2007-01-01 *2009-12-31 *2008-01-01 *2008-01-01     NA      *2007-01-01
+
+Veles1      *2007-01-01 *2011-03-17 *2009-05-07 *2009-04-15     NA      *2007-01-01
+Veles2      *2007-01-01 *2012-01-01 *2008-01-01 ?2008-01-01     NA      *2007-01-23
+Kocani      *2002-10-29 *2002-10-31 *2002-10-28 *2002-10-31     NA      *2002-12-05
+Kavadarci   *2007-01-01    ?NA      *2008-01-01 ?2008-01-01     NA      *2007-01-01
+Kumanovo    *2007-01-01  2012-01-01 *2008-01-01 ?2007-01-01     NA      *2008-01-01
+
+
+! = 2011-09-10 zero measurements
+* = definite start
+? = not checked completelly
+
+
+                          UPDATE PROGRESS
+
+Station        CO       NO2      O3      PM10     PM25      SO2
+----------- -------- -------- -------- -------- -------- --------
+Centar          ✓        ✓        ✓       ✓         ✓        ✓
+Karpos          ✓        ✓        ✓       ✓         ✓        ✓
+Lisice          ✓        ✓        ✓       ✓                  ✓
+GaziBaba        ✓        ✓                ✓                  ✓ 
+Rektorat        ✓        ✓        ✓       ✓
+Miladinovci     ✓        ✓        ✓       ✓                  ✓
+Mrsevci         ✓        ✓                ✓                  ✓
+
+Bitola1         ✓        ✓        ✓       ✓                  ✓
+Bitola2         ✓        ✓        ✓       ✓                  ✓
+Kicevo          ✓        ✓        ✓       ✓                  ✓
+Lazaropole               ✓        ✓       ✓                  ✓
+Tetovo          ✓        ✓        ✓       ✓                  ✓
+
+Veles1          ✓        ✓        ✓       ✓                  ✓
+Veles2          ✓        ✓        ✓       ✓                  ✓
+Kocani          ✓        ✓        ✓       ✓                  ✓
+Kavadarci       ✓                 ✓       ✓                  ✓
+Kumanovo        ✓        ✓        ✓       ✓                  ✓
+

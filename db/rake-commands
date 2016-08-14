@@ -1,0 +1,28 @@
+# regions
+rake "db:new_migration[CreateRegion, name:string:index mk:text]"
+
+# stations
+rake "db:new_migration[CreateStation, name:string:index mk:text region_id:integer:index]"
+
+# parameters
+rake "db:new_migration[CreateParameter, name:string:index mk:text unit:string short:string short_no_subscript:string levels:text]"
+
+# update 
+rake "db:new_migration[CreateUpdate, day:date parameter_id:integer:index station_id:integer:index]"
+
+# measurement
+# data shoulb be JSON string { "yyyy-mm-dd hh:mm": nn.nn,... }
+# NOTE: originaly day was not indexed
+rake "db:new_migration[CreateMeasurement, day:date:index parameter_id:integer:index station_id:integer:index count:integer min:float max:float avg:float data:text]"
+
+# add index to Measurements on day
+# NOTE: don't use this migration!
+rake "db:new_migration[AddIndexToMeasurementOnDay, day]"
+#   def self.up
+#     add_index :measurements, :day
+#   end
+# 
+#   def self.down
+#     remove_index :measurements, :day
+#   end
+
